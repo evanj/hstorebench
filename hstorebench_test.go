@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"strings"
@@ -20,6 +21,62 @@ const rngSeed = 123 // to try to make tests repeatable
 func genString(rng *mathrand.Rand) string {
 	s := fmt.Sprintf("%016x", rng.Int63())
 	return s[0 : 1+rng.Intn(len(s)-1)]
+}
+
+var errHstoreDoesNotExist = errors.New("postgres type hstore does not exist (the extension may not be loaded)")
+
+func registerHstore(ctx context.Context, conn *pgx.Conn) error {
+	// get the hstore OID: it varies because hstore is an extension and not built-in
+	var hstoreOID uint32
+	err := conn.QueryRow(ctx, `select oid from pg_type where typname = 'hstore'`).Scan(&hstoreOID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return errHstoreDoesNotExist
+		}
+		return err
+	}
+
+	conn.TypeMap().RegisterType(&pgtype.Type{Name: "hstore", OID: hstoreOID, Codec: pgtype.HstoreCodec{}})
+	return nil
+}
+
+func TestRegisterHstore(t *testing.T) {
+	postgresURL := postgrestest.New(t)
+	ctx := context.Background()
+	pgxConn, err := pgx.Connect(ctx, postgresURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pgxConn.Close(ctx) })
+
+	pgt, ok := pgxConn.TypeMap().TypeForName("hstore")
+	if !(pgt == nil && !ok) {
+		t.Fatalf("did not expect hstore to be registered; TypeForName returned: pgt=%#v ok=%#v",
+			pgt, ok)
+	}
+
+	// extension not registered
+	err = registerHstore(ctx, pgxConn)
+	if err != errHstoreDoesNotExist {
+		t.Errorf("extension not registered; expected errHstoreDoesNotExist, got err=%#v", err)
+	}
+
+	_, err = pgxConn.Exec(ctx, "create extension hstore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = registerHstore(ctx, pgxConn)
+	if err != nil {
+		t.Fatalf("extension registered but got err=%#v", err)
+	}
+	pgt, ok = pgxConn.TypeMap().TypeForName("hstore")
+	if !(pgt != nil && ok) {
+		t.Fatalf("hstore must be registered; TypeForName returned: pgt=%#v ok=%#v",
+			pgt, ok)
+	}
+	if pgt.Codec.PreferredFormat() != pgtype.BinaryFormatCode {
+		t.Errorf("expected preferred format to be binary, was %d", pgt.Codec.PreferredFormat())
+	}
 }
 
 func BenchmarkHstore(b *testing.B) {
@@ -50,6 +107,15 @@ func BenchmarkHstore(b *testing.B) {
 	if err != nil {
 		panic(err)
 	}
+
+	// create a pgx connection with hstore registered as an explicit type; uses binary format
+	pgxConnHstoreRegistered, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		panic(err)
+	}
+	registerHstore(ctx, pgxConnHstoreRegistered)
+	b.Cleanup(func() { pgxConnHstoreRegistered.Close(context.Background()) })
+
 	_, err = pgxConn.Exec(ctx, "CREATE TABLE benchmark (kv HSTORE)")
 	if err != nil {
 		panic(err)
@@ -82,8 +148,7 @@ func BenchmarkHstore(b *testing.B) {
 
 		rowBuilder.WriteByte('\'')
 
-		insert := fmt.Sprintf("INSERT INTO benchmark VALUES (%s);", rowBuilder.String())
-		_, err = pgxConn.Exec(ctx, insert)
+		_, err = pgxConn.Exec(ctx, "INSERT INTO benchmark VALUES ($1);", rowBuilder.String())
 		if err != nil {
 			panic(err)
 		}
@@ -124,10 +189,47 @@ func BenchmarkHstore(b *testing.B) {
 		}
 		return rows.Err()
 	}
+	// calls rows.Values() on a connections with hstore registered which returns a pgtype.Hstore
+	pgxValuesHstoreRegistered := func() error {
+		rows, err := pgxConnHstoreRegistered.Query(ctx, query)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			values, err := rows.Values()
+			if err != nil {
+				return err
+			}
+			if len(values) != 1 {
+				return fmt.Errorf("unexpected values: %#v", values)
+			}
+			// values[0] is of type pgtype.Hstore
+			// panic(fmt.Sprintf("%#v %T", values[0], values[0]))
+		}
+		return rows.Err()
+	}
 	pgxScanHstore := func() error {
 		scanHstore := pgtype.Hstore{}
 		scanArgs := []interface{}{&scanHstore}
 		rows, err := pgxConn.Query(ctx, query)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			err := rows.Scan(scanArgs...)
+			if err != nil {
+				return err
+			}
+			if len(scanHstore) == 0 {
+				return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+			}
+		}
+		return rows.Err()
+	}
+	pgxScanHstoreRegistered := func() error {
+		scanHstore := pgtype.Hstore{}
+		scanArgs := []interface{}{&scanHstore}
+		rows, err := pgxConnHstoreRegistered.Query(ctx, query)
 		if err != nil {
 			return err
 		}
@@ -163,7 +265,9 @@ func BenchmarkHstore(b *testing.B) {
 
 	b.Run("pgxRawValues", timeIt(pgxRawValues))
 	b.Run("pgxValuesString", timeIt(pgxValuesString))
+	b.Run("pgxValuesHstoreRegistered", timeIt(pgxValuesHstoreRegistered))
 	b.Run("pgxScanHstore", timeIt(pgxScanHstore))
+	b.Run("pgxScanHstoreRegistered", timeIt(pgxScanHstoreRegistered))
 	b.Run("pgxsqlScanHstore", timeIt(sqlScanHstore))
 }
 
