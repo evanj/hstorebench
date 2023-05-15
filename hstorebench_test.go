@@ -226,24 +226,6 @@ func BenchmarkHstore(b *testing.B) {
 		}
 		return rows.Err()
 	}
-	pgxScanHstoreRegistered := func() error {
-		scanHstore := pgtype.Hstore{}
-		scanArgs := []interface{}{&scanHstore}
-		rows, err := pgxConnHstoreRegistered.Query(ctx, query)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			err := rows.Scan(scanArgs...)
-			if err != nil {
-				return err
-			}
-			if len(scanHstore) == 0 {
-				return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
-			}
-		}
-		return rows.Err()
-	}
 	sqlScanHstore := func() error {
 		scanHstore := pgtype.Hstore{}
 		scanArgs := []interface{}{&scanHstore}
@@ -267,8 +249,37 @@ func BenchmarkHstore(b *testing.B) {
 	b.Run("pgxValuesString", timeIt(pgxValuesString))
 	b.Run("pgxValuesHstoreRegistered", timeIt(pgxValuesHstoreRegistered))
 	b.Run("pgxScanHstore", timeIt(pgxScanHstore))
-	b.Run("pgxScanHstoreRegistered", timeIt(pgxScanHstoreRegistered))
 	b.Run("pgxsqlScanHstore", timeIt(sqlScanHstore))
+
+	// test pgx.Scan with the registered codec with all query modes
+	// some use the binary protocol and some use the text protocol
+	queryModes := []pgx.QueryExecMode{
+		pgx.QueryExecModeCacheStatement,
+		pgx.QueryExecModeCacheDescribe,
+		pgx.QueryExecModeDescribeExec,
+		pgx.QueryExecModeExec,
+		pgx.QueryExecModeSimpleProtocol,
+	}
+	for _, queryMode := range queryModes {
+		b.Run("pgxScanRegistered/mode="+queryMode.String(), timeIt(func() error {
+			scanHstore := pgtype.Hstore{}
+			scanArgs := []interface{}{&scanHstore}
+			rows, err := pgxConnHstoreRegistered.Query(ctx, query, queryMode)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				err := rows.Scan(scanArgs...)
+				if err != nil {
+					return err
+				}
+				if len(scanHstore) == 0 {
+					return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+				}
+			}
+			return rows.Err()
+		}))
+	}
 }
 
 func timeIt(f func() error) func(b *testing.B) {
