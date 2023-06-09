@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"strings"
@@ -23,25 +22,16 @@ func genString(rng *mathrand.Rand) string {
 	return s[0 : 1+rng.Intn(len(s)-1)]
 }
 
-var errHstoreDoesNotExist = errors.New("postgres type hstore does not exist (the extension may not be loaded)")
-
-func registerHstore(ctx context.Context, conn *pgx.Conn) error {
-	// get the hstore OID: it varies because hstore is an extension and not built-in
-	var hstoreOID uint32
-	err := conn.QueryRow(ctx, `select oid from pg_type where typname = 'hstore'`).Scan(&hstoreOID)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return errHstoreDoesNotExist
-		}
-		return err
-	}
-
-	conn.TypeMap().RegisterType(&pgtype.Type{Name: "hstore", OID: hstoreOID, Codec: pgtype.HstoreCodec{}})
-	return nil
-}
-
 func TestRegisterHstore(t *testing.T) {
-	postgresURL := postgrestest.New(t)
+	instance, err := postgrestest.NewInstanceWithOptions(postgrestest.Options{ListenOnLocalhost: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	postgresURL := "postgresql://127.0.0.1:5432/postgres"
+	// postgresURL := instance.LocalhostURL()
+
+	// postgresURL := postgrestest.New(t)
 	ctx := context.Background()
 	pgxConn, err := pgx.Connect(ctx, postgresURL)
 	if err != nil {
@@ -81,7 +71,24 @@ func TestRegisterHstore(t *testing.T) {
 
 func BenchmarkHstore(b *testing.B) {
 	b.Log("starting postgres instance")
-	postgresURL := postgrestest.New(b)
+
+	instance, err := postgrestest.NewInstanceWithOptions(postgrestest.Options{ListenOnLocalhost: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer instance.Close()
+	postgresURL := "postgresql://127.0.0.1:5432/postgres"
+	// // postgresURL := instance.LocalhostURL()
+
+	// // postgresURL := postgrestest.New(t)
+	// ctx := context.Background()
+	// pgxConn, err := pgx.Connect(ctx, postgresURL)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
+	// t.Cleanup(func() { pgxConn.Close(ctx) })
+
+	// postgresURL := postgrestest.New(b)
 
 	cfg, err := pgx.ParseConfig(postgresURL)
 	if err != nil {
@@ -208,24 +215,6 @@ func BenchmarkHstore(b *testing.B) {
 		}
 		return rows.Err()
 	}
-	pgxScanHstore := func() error {
-		scanHstore := pgtype.Hstore{}
-		scanArgs := []interface{}{&scanHstore}
-		rows, err := pgxConn.Query(ctx, query)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			err := rows.Scan(scanArgs...)
-			if err != nil {
-				return err
-			}
-			if len(scanHstore) == 0 {
-				return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
-			}
-		}
-		return rows.Err()
-	}
 	sqlScanHstore := func() error {
 		scanHstore := pgtype.Hstore{}
 		scanArgs := []interface{}{&scanHstore}
@@ -248,7 +237,6 @@ func BenchmarkHstore(b *testing.B) {
 	b.Run("pgxRawValues", timeIt(pgxRawValues))
 	b.Run("pgxValuesString", timeIt(pgxValuesString))
 	b.Run("pgxValuesHstoreRegistered", timeIt(pgxValuesHstoreRegistered))
-	b.Run("pgxScanHstore", timeIt(pgxScanHstore))
 	b.Run("pgxsqlScanHstore", timeIt(sqlScanHstore))
 
 	// test pgx.Scan with the registered codec with all query modes
@@ -260,25 +248,35 @@ func BenchmarkHstore(b *testing.B) {
 		pgx.QueryExecModeExec,
 		pgx.QueryExecModeSimpleProtocol,
 	}
-	for _, queryMode := range queryModes {
-		b.Run("pgxScanRegistered/mode="+queryMode.String(), timeIt(func() error {
-			scanHstore := pgtype.Hstore{}
-			scanArgs := []interface{}{&scanHstore}
-			rows, err := pgxConnHstoreRegistered.Query(ctx, query, queryMode)
-			if err != nil {
-				return err
-			}
-			for rows.Next() {
-				err := rows.Scan(scanArgs...)
+	connLabels := []struct {
+		label string
+		conn  *pgx.Conn
+	}{
+		{"default", pgxConn},
+		{"hstore_registered", pgxConnHstoreRegistered},
+	}
+	for _, connLabel := range connLabels {
+		for _, queryMode := range queryModes {
+			label := fmt.Sprintf("pgxScan/%s/mode=%s", connLabel.label, queryMode)
+			b.Run(label, timeIt(func() error {
+				scanHstore := pgtype.Hstore{}
+				scanArgs := []interface{}{&scanHstore}
+				rows, err := connLabel.conn.Query(ctx, query, queryMode)
 				if err != nil {
 					return err
 				}
-				if len(scanHstore) == 0 {
-					return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+				for rows.Next() {
+					err := rows.Scan(scanArgs...)
+					if err != nil {
+						return err
+					}
+					if len(scanHstore) == 0 {
+						return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+					}
 				}
-			}
-			return rows.Err()
-		}))
+				return rows.Err()
+			}))
+		}
 	}
 }
 
