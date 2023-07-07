@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -12,18 +13,51 @@ import (
 
 var errHstoreDoesNotExist = errors.New("postgres type hstore does not exist (the extension may not be loaded)")
 
-func registerHstore(ctx context.Context, conn *pgx.Conn) error {
+// queryHstoreOID returns the Postgres Object Identifer (OID) for the "hstore" type. This must be
+// done for each separate Postgres database, since the OID can be different. It returns
+// errHstoreDoesNotExist if the row does not exist.
+func queryHstoreOID(ctx context.Context, conn *pgx.Conn) (uint32, error) {
 	// get the hstore OID: it varies because hstore is an extension and not built-in
 	var hstoreOID uint32
 	err := conn.QueryRow(ctx, `select oid from pg_type where typname = 'hstore'`).Scan(&hstoreOID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return errHstoreDoesNotExist
+			return 0, errHstoreDoesNotExist
 		}
+		return 0, err
+	}
+	return hstoreOID, nil
+}
+
+// queryHstoreOIDSQL returns the Postgres Object Identifer (OID) for the "hstore" type. This must be
+// done for each separate Postgres database, since the OID can be different. It returns
+// errHstoreDoesNotExist if the row does not exist.
+func queryHstoreOIDSQL(ctx context.Context, db *sql.DB) (uint32, error) {
+	// get the hstore OID: it varies because hstore is an extension and not built-in
+	var hstoreOID uint32
+	err := db.QueryRowContext(ctx, `select oid from pg_type where typname = 'hstore'`).Scan(&hstoreOID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, errHstoreDoesNotExist
+		}
+		return 0, err
+	}
+	return hstoreOID, nil
+}
+
+// registerHstoreTypeMap registers the hstore type with typeMap. It uses conn to query for
+func registerHstoreTypeMap(hstoreOID uint32, typeMap *pgtype.Map) {
+	typeMap.RegisterType(&pgtype.Type{Codec: pgtype.HstoreCodec{}, Name: "hstore", OID: hstoreOID})
+}
+
+// registerHstore registers the hstore type with this connection's default type map. A connection
+// can only access a specific database, so
+func registerHstore(ctx context.Context, conn *pgx.Conn) error {
+	hstoreOID, err := queryHstoreOID(ctx, conn)
+	if err != nil {
 		return err
 	}
-
-	conn.TypeMap().RegisterType(&pgtype.Type{Name: "hstore", OID: hstoreOID, Codec: pgtype.HstoreCodec{}})
+	registerHstoreTypeMap(hstoreOID, conn.TypeMap())
 	return nil
 }
 

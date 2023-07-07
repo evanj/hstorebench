@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/evanj/hacks/postgrestest"
+	"github.com/evanj/pgxtypefaster"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -23,15 +24,7 @@ func genString(rng *mathrand.Rand) string {
 }
 
 func TestRegisterHstore(t *testing.T) {
-	instance, err := postgrestest.NewInstanceWithOptions(postgrestest.Options{ListenOnLocalhost: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer instance.Close()
-	postgresURL := "postgresql://127.0.0.1:5432/postgres"
-	// postgresURL := instance.LocalhostURL()
-
-	// postgresURL := postgrestest.New(t)
+	postgresURL := postgrestest.New(t)
 	ctx := context.Background()
 	pgxConn, err := pgx.Connect(ctx, postgresURL)
 	if err != nil {
@@ -69,6 +62,20 @@ func TestRegisterHstore(t *testing.T) {
 	}
 }
 
+// HstoreSQLBinary uses the binary protocol with the database/sql API.
+// This is a proof-of-concept hack more than a good idea.
+type HstoreSQLBinary struct {
+	pgxtypefaster.Hstore
+}
+
+var pgxfasterBinaryScanPlan = pgxtypefaster.HstoreCodec{}.PlanScan(
+	nil, 0, pgtype.BinaryFormatCode, (*pgxtypefaster.Hstore)(nil))
+
+// Scan implements the database/sql Scanner interface.
+func (h *HstoreSQLBinary) Scan(src any) error {
+	return pgxfasterBinaryScanPlan.Scan([]byte(src.(string)), &h.Hstore)
+}
+
 func BenchmarkHstore(b *testing.B) {
 	b.Log("starting postgres instance")
 
@@ -77,18 +84,7 @@ func BenchmarkHstore(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer instance.Close()
-	postgresURL := "postgresql://127.0.0.1:5432/postgres"
-	// // postgresURL := instance.LocalhostURL()
-
-	// // postgresURL := postgrestest.New(t)
-	// ctx := context.Background()
-	// pgxConn, err := pgx.Connect(ctx, postgresURL)
-	// if err != nil {
-	// 	t.Fatal(err)
-	// }
-	// t.Cleanup(func() { pgxConn.Close(ctx) })
-
-	// postgresURL := postgrestest.New(b)
+	postgresURL := instance.URL()
 
 	cfg, err := pgx.ParseConfig(postgresURL)
 	if err != nil {
@@ -120,8 +116,22 @@ func BenchmarkHstore(b *testing.B) {
 	if err != nil {
 		panic(err)
 	}
-	registerHstore(ctx, pgxConnHstoreRegistered)
+	err = registerHstore(ctx, pgxConnHstoreRegistered)
+	if err != nil {
+		panic(err)
+	}
 	b.Cleanup(func() { pgxConnHstoreRegistered.Close(context.Background()) })
+
+	// create a pgx connection with hstore registered as an explicit type; uses binary format
+	pgxConnFasterHstoreRegistered, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		panic(err)
+	}
+	err = pgxtypefaster.RegisterHstore(ctx, pgxConnFasterHstoreRegistered)
+	if err != nil {
+		panic(err)
+	}
+	b.Cleanup(func() { pgxConnFasterHstoreRegistered.Close(context.Background()) })
 
 	_, err = pgxConn.Exec(ctx, "CREATE TABLE benchmark (kv HSTORE)")
 	if err != nil {
@@ -161,6 +171,11 @@ func BenchmarkHstore(b *testing.B) {
 		}
 	}
 	b.Logf("   generated %d total KV bytes\n", totalKVBytes)
+
+	hstoreOID, err := queryHstoreOIDSQL(ctx, sqlDB)
+	if err != nil {
+		panic(err)
+	}
 
 	const query = "SELECT kv FROM benchmark"
 	pgxRawValues := func() error {
@@ -233,11 +248,61 @@ func BenchmarkHstore(b *testing.B) {
 		}
 		return rows.Err()
 	}
+	sqlScanHstoreFaster := func() error {
+		scanHstore := pgxtypefaster.Hstore{}
+		scanArgs := []interface{}{&scanHstore}
+		rows, err := sqlDB.QueryContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			err := rows.Scan(scanArgs...)
+			if err != nil {
+				return err
+			}
+			if len(scanHstore) == 0 {
+				return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+			}
+		}
+		return rows.Err()
+	}
+	sqlScanHstoreFasterRawBinary := func() error {
+		hstorePGType := &pgtype.Type{Codec: pgxtypefaster.HstoreCodec{}, Name: "hstore", OID: hstoreOID}
+
+		var scanHstore pgxtypefaster.Hstore
+		scanArgs := []interface{}{&scanHstore}
+		conn, err := sqlDB.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		return conn.Raw(func(driverConn any) error {
+			pgxConn := driverConn.(*stdlib.Conn).Conn()
+			pgxConn.TypeMap().RegisterType(hstorePGType)
+			rows, err := pgxConn.Query(ctx, query)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				err := rows.Scan(scanArgs...)
+				if err != nil {
+					return err
+				}
+				if len(scanHstore) == 0 {
+					return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+				}
+			}
+			return rows.Err()
+		})
+	}
 
 	b.Run("pgxRawValues", timeIt(pgxRawValues))
 	b.Run("pgxValuesString", timeIt(pgxValuesString))
 	b.Run("pgxValuesHstoreRegistered", timeIt(pgxValuesHstoreRegistered))
 	b.Run("pgxsqlScanHstore", timeIt(sqlScanHstore))
+	b.Run("pgxsqlScanHstoreFaster", timeIt(sqlScanHstoreFaster))
+	b.Run("pgxsqlScanHstoreBinaryRawConn", timeIt(sqlScanHstoreFasterRawBinary))
 
 	// test pgx.Scan with the registered codec with all query modes
 	// some use the binary protocol and some use the text protocol
@@ -248,20 +313,38 @@ func BenchmarkHstore(b *testing.B) {
 		pgx.QueryExecModeExec,
 		pgx.QueryExecModeSimpleProtocol,
 	}
-	connLabels := []struct {
-		label string
-		conn  *pgx.Conn
+	connConfigs := []struct {
+		label      string
+		conn       *pgx.Conn
+		newScanArg func() any
+		scanArgLen func(arg any) int
 	}{
-		{"default", pgxConn},
-		{"hstore_registered", pgxConnHstoreRegistered},
+		{
+			"default",
+			pgxConn,
+			func() any { return &pgtype.Hstore{} },
+			func(scanArg any) int { return len(*scanArg.(*pgtype.Hstore)) },
+		},
+		{
+			"hstore_registered",
+			pgxConnHstoreRegistered,
+			func() any { return &pgtype.Hstore{} },
+			func(scanArg any) int { return len(*scanArg.(*pgtype.Hstore)) },
+		},
+		{
+			"faster_hstore_registered",
+			pgxConnFasterHstoreRegistered,
+			func() any { return &pgxtypefaster.Hstore{} },
+			func(scanArg any) int { return len(*scanArg.(*pgxtypefaster.Hstore)) },
+		},
 	}
-	for _, connLabel := range connLabels {
+	for _, connConfig := range connConfigs {
 		for _, queryMode := range queryModes {
-			label := fmt.Sprintf("pgxScan/%s/mode=%s", connLabel.label, queryMode)
+			scanArgs := []interface{}{connConfig.newScanArg()}
+
+			label := fmt.Sprintf("pgxScan/%s/mode=%s", connConfig.label, queryMode)
 			b.Run(label, timeIt(func() error {
-				scanHstore := pgtype.Hstore{}
-				scanArgs := []interface{}{&scanHstore}
-				rows, err := connLabel.conn.Query(ctx, query, queryMode)
+				rows, err := connConfig.conn.Query(ctx, query, queryMode)
 				if err != nil {
 					return err
 				}
@@ -270,8 +353,8 @@ func BenchmarkHstore(b *testing.B) {
 					if err != nil {
 						return err
 					}
-					if len(scanHstore) == 0 {
-						return fmt.Errorf("unexpected empty hstore: %#v", scanHstore)
+					if connConfig.scanArgLen(scanArgs[0]) == 0 {
+						return fmt.Errorf("unexpected empty hstore: %#v", scanArgs[0])
 					}
 				}
 				return rows.Err()
